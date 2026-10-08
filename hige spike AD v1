@@ -1,0 +1,145 @@
+//@version=6
+// ============================================================================
+// 髭スパイク戦略 候補A〜D 照合用ストラテジー v1（2026-10-08）
+//   A: 1時間足 日中前半の上髭2倍  成行買い  40本後決済
+//   B: 1時間足 上髭3倍＋雲の上＋出来高1.5倍  成行買い  40本後決済
+//   C: 1時間足 下髭5倍＋三役逆転  確認買い  20本後決済
+//   D: 30分足  下髭2倍＋安値スイープ＋直前5本騰落  確認買い  20本後決済
+// 定義は引き継ぎメモ および feat.py / sim3.py / fin.py に合わせています。
+// ============================================================================
+strategy(“髭スパイク 候補A-D 照合用”, shorttitle=“Hige A-D”, overlay=true,
+initial_capital=1000000000, currency=currency.JPY,
+default_qty_type=strategy.fixed, default_qty_value=1,
+pyramiding=1, slippage=1, margin_long=0, margin_short=0,
+process_orders_on_close=false, calc_on_every_tick=false)
+
+// –––––––––––––––––––––––––––––––– 入力
+string G1 = “候補”
+string candIn  = input.string(“A”, “候補”, options=[“A”, “B”, “C”, “D”], group=G1)
+bool   useSpike = input.bool(true, “スパイク条件を使う（OFF＝スパイクなし比較）”, group=G1)
+
+string G2 = “期間（シグナル足の開始時刻で判定）”
+int tStart = input.time(timestamp(“2017-01-01T00:00:00+09:00”), “開始”, group=G2)
+int tEnd   = input.time(timestamp(“2099-12-31T00:00:00+09:00”), “終了”, group=G2)
+
+string G3 = “確認買い（候補C・D）”
+float  confOffset = input.float(5.0, “逆指値＝シグナル足高値＋（円）”, step=5.0, group=G3)
+int    confBars   = input.int(3, “有効本数”, minval=1, maxval=3, group=G3)
+string M_PAR = “並行（各シグナルが独自の逆指値・Python近似）”
+string M_IGN = “無視（待機中は新規シグナルを見ない・メモの定義）”
+string pendMode = input.string(M_PAR, “注文待ち中の新シグナル”, options=[M_PAR, M_IGN], group=G3)
+
+string G4 = “数量”
+string Q_PCT = “建玉金額一定（損益を率で評価）”
+string Q_ONE = “固定1枚”
+string qtyMode  = input.string(Q_PCT, “数量の決め方”, options=[Q_PCT, Q_ONE], group=G4)
+float  notional = input.float(1000000000, “建玉金額（円）”, minval=1000000, group=G4,
+tooltip=“純損益÷この金額×100 が、Python側の損益率（%）の合計に相当します”)
+
+// –––––––––––––––––––––––––––––––– 候補ごとの設定
+bool isA = candIn == “A”
+bool isB = candIn == “B”
+bool isC = candIn == “C”
+bool isD = candIn == “D”
+
+float  kMult     = isA ? 2.0 : isB ? 3.0 : isC ? 5.0 : 2.0
+bool   upperSide = isA or isB          // true＝上髭、false＝下髭
+bool   useConf   = isC or isD          // true＝確認買い、false＝成行
+int    holdBars  = (isA or isB) ? 40 : 20
+string needTF    = isD ? “30” : “60”
+
+// –––––––––––––––––––––––––––––––– 共通の定義
+float body    = math.abs(close - open)
+float upWick  = high - math.max(open, close)
+float loWick  = math.min(open, close) - low
+bool  upSpike = body > 0 and upWick >= body * kMult and not (loWick >= body * kMult)
+bool  loSpike = body > 0 and loWick >= body * kMult and not (upWick >= body * kMult)
+bool  spikeOK = not useSpike or (upperSide ? upSpike : loSpike)
+
+float atr = ta.atr(14)
+
+// 時刻（日本時間・足の開始時刻）
+int jMin = hour(time, “Asia/Tokyo”) * 60 + minute(time, “Asia/Tokyo”)
+
+// 一目均衡表（現在足に表示される雲＝25本前の先行スパン）
+float tenkan = (ta.highest(high, 9) + ta.lowest(low, 9)) / 2
+float kijun  = (ta.highest(high, 26) + ta.lowest(low, 26)) / 2
+float spanA  = (tenkan + kijun) / 2
+float spanB  = (ta.highest(high, 52) + ta.lowest(low, 52)) / 2
+float cloudTop = math.max(spanA[25], spanB[25])
+float cloudBot = math.min(spanA[25], spanB[25])
+
+// –––––––––––––––––––––––––––––––– 各候補の条件
+// A：開始時刻 8:45以上 11:30未満
+bool condA = jMin >= 8 * 60 + 45 and jMin < 11 * 60 + 30
+
+// B：終値が雲の上 かつ 出来高 > 20本平均（当該足を含む）×1.5
+bool condB = close > cloudTop and volume > ta.sma(volume, 20) * 1.5
+
+// C：三役逆転
+bool condC = close < cloudBot and tenkan < kijun and close < low[26]
+
+// D：安値スイープ（高値スイープにも該当する足は除く）＋ 直前5本騰落
+float prevLow  = ta.lowest(low, 20)[1]
+float prevHigh = ta.highest(high, 20)[1]
+bool  sweepHi  = high > prevHigh and close < prevHigh
+bool  sweepLo  = low < prevLow and close > prevLow and not sweepHi
+float mom5     = (close[1] - close[6]) / atr
+bool  condD    = sweepLo and mom5 > -2.0 and mom5 <= -0.7
+
+bool condOK   = isA ? condA : isB ? condB : isC ? condC : condD
+bool inPeriod = time >= tStart and time <= tEnd
+bool warmedUp = bar_index >= 260
+bool rawSignal = spikeOK and condOK and inPeriod and warmedUp and barstate.isconfirmed
+
+// –––––––––––––––––––––––––––––––– 状態
+bool isFlat = strategy.position_size == 0
+bool inPos  = strategy.position_size > 0
+var int lastSigBar = na     // 直近に注文を出したシグナル足
+
+// –––––––––––––––––––––––––––––––– 決済：N本後（エントリー足を1本目として N本目の終値）
+if inPos
+strategy.cancel_all()   // 残っている確認買い注文を取り消し
+int held = bar_index - strategy.opentrades.entry_bar_index(0) + 1
+if held >= holdBars and barstate.isconfirmed
+strategy.close_all(comment=str.tostring(holdBars) + “本後”, immediately=true)
+
+// –––––––––––––––––––––––––––––––– 確認買いの期限切れ（シグナル後 confBars 本で取り消し）
+if useConf and bar_index >= confBars
+strategy.cancel(“L” + str.tostring((bar_index - confBars) % 4))
+
+// –––––––––––––––––––––––––––––––– エントリー
+// 保有中（決済足を含む）は新規シグナルを無視。次のシグナルは決済足の次の足から。
+bool pendBlock = useConf and pendMode == M_IGN and not na(lastSigBar) and bar_index - lastSigBar < confBars
+bool takeSignal = rawSignal and isFlat and not pendBlock
+
+float qty = qtyMode == Q_PCT ? math.max(1.0, math.round(notional / (close * syminfo.pointvalue))) : 1.0
+
+if takeSignal
+lastSigBar := bar_index
+if useConf
+// シグナル足高値＋5円の逆指値。窓を開けて超えた場合は始値で約定（＝max(逆指値, 始値)）
+strategy.entry(“L” + str.tostring(bar_index % 4), strategy.long, qty=qty,
+stop=high + confOffset, comment=candIn + “ 確認”)
+else
+// 次の足の始値で成行
+strategy.entry(“L”, strategy.long, qty=qty, comment=candIn + “ 成行”)
+
+// –––––––––––––––––––––––––––––––– 表示
+plotshape(takeSignal, title=“採用シグナル”, style=shape.triangleup, location=location.belowbar,
+color=color.new(color.teal, 0), size=size.tiny)
+plotshape(rawSignal and not takeSignal, title=“無視されたシグナル”, style=shape.circle, location=location.belowbar,
+color=color.new(color.gray, 40), size=size.tiny)
+
+var table info = table.new(position.top_right, 1, 3, bgcolor=color.new(color.black, 20), border_width=1)
+if barstate.islast
+bool tfOK = timeframe.period == needTF
+string l1 = “候補” + candIn + “  “ + (upperSide ? “上髭” : “下髭”) + str.tostring(kMult) + “倍 “ +
+(useSpike ? “” : “【スパイクなし】”) + (useConf ? “確認買い” : “成行”) + “ / “ + str.tostring(holdBars) + “本後決済”
+string l2 = tfOK ? “時間足 OK（” + (isD ? “30分足” : “1時間足”) + “）” : “⚠ この候補は” + (isD ? “30分足” : “1時間足”) + “で使ってください”
+string l3 = “決済済み “ + str.tostring(strategy.closedtrades) + “回 / 勝率 “ +
+str.tostring(strategy.closedtrades > 0 ? 100.0 * strategy.wintrades / strategy.closedtrades : 0.0, “#.0”) + “% / PF “ +
+str.tostring(strategy.grossloss > 0 ? strategy.grossprofit / strategy.grossloss : 0.0, “#.00”)
+table.cell(info, 0, 0, l1, text_color=color.white, text_size=size.small, text_halign=text.align_left)
+table.cell(info, 0, 1, l2, text_color=tfOK ? color.white : color.yellow, text_size=size.small, text_halign=text.align_left)
+table.cell(info, 0, 2, l3, text_color=color.white, text_size=size.small, text_halign=text.align_left)
