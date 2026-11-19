@@ -1,0 +1,221 @@
+//@version=6
+strategy("分水嶺 日の線ブレイク v3", shorttitle="分水嶺BO3", overlay=true,
+     process_orders_on_close=true, pyramiding=0,
+     initial_capital=1000000, default_qty_type=strategy.fixed, default_qty_value=1,
+     commission_type=strategy.commission.cash_per_contract, commission_value=500)
+
+// =====================================================================
+// 日の γ・α・Ω を 60分足の確定で抜けたら、その方向に入る。
+//   利確：次の線（分水嶺を含む4本のうち、D×0.1 より先で一番近い線）
+//   損切り：抜けた線から D×0.25 戻ったところ
+//   決済：利確・損切りに届かなければ、日の終わりの足の終値
+//   条件：週の分水嶺と同じ側のときだけ（買いは週Wより上）
+// 5分足チャートで使う（60分の区切りはスクリプトの中で作る）。
+// v3（202611131）：引けの板寄せの足の時刻を時期ごとに持つように直した。
+//   夜間の終わり：2021/9/17 までは 5:30、それ以降は 6:00。日中の終わり：2024/11/1 までは 15:15、それ以降は 15:45。
+//   v2 は 2021/9/21 より前に日の終わりで手じまわず、2024/11/5 より前は 15:15 の足を60分の確定にしていなかった。
+//   板寄せの足が無い日は、次の日の最初の足で手じまう（研究はその前の足の終値。まれ）。
+//   注文のコメントに、版・線・利確・損切りの値を入れる（取引一覧の書き出しで研究と照らし合わせる）。
+// 手数料は「プロパティ」で設定：ミニは 1枚・片道 500円（往復10円 pt）を初期値にしています。
+// =====================================================================
+
+dirSel   = input.string("買いだけ", "向き", options=["買いだけ", "売りだけ", "両方"])
+useWk    = input.bool(true, "買い：週の分水嶺より上のときだけ")
+useWkS   = input.bool(false, "売り：週の分水嶺より下のときだけ", tooltip="検証では、売りはこの条件なしの方が良かった。")
+slK      = input.float(0.25, "損切り：抜けた線から D×", step=0.05)
+tpK      = input.float(0.0,  "利確：次の線の手前 D×（0＝ちょうど）", step=0.05)
+startT   = input.time(timestamp("2017-01-01T00:00:00+09:00"), "開始日")
+cutSel   = input.string("自動", "日の区切り", options=["自動", "先物（6:05）", "CFD（7:00）"],
+     tooltip="自動：先物なら 6:05、それ以外は 7:00。CFD の日の終わりは、NY 17:00（夏 6:00・冬 7:00）。")
+showLn   = input.bool(true, "線を表示")
+
+// ----- 除く条件（v2 で追加。初期値はすべてオフ＝v1 と同じ動き） -----
+fQuiet   = input.bool(false, "買い：前日が静かな日を除く", group="除く条件（買い）",
+     tooltip="前日の値幅が、20日平均の値幅×下の倍率より小さい日は買わない。")
+qK       = input.float(0.6, "　倍率", step=0.05, group="除く条件（買い）")
+fSmallD  = input.bool(false, "買い：D が小さい日を除く", group="除く条件（買い）",
+     tooltip="D（分水嶺とγの幅）が、20日平均の値幅×下の倍率より小さい日は買わない。")
+dK       = input.float(0.3, "　倍率", step=0.05, group="除く条件（買い）")
+fDayL    = input.bool(false, "買い：日中だけ", group="除く条件（買い）")
+fOS      = input.bool(true, "売り：売られすぎを除く", group="除く条件（売り）",
+     tooltip="値段が20日平均（日の終値）より下の％以上下にあるときは売らない。")
+osK      = input.float(2.0, "　％", step=0.5, group="除く条件（売り）")
+fBigD    = input.bool(true, "売り：値幅の大きい日を除く", group="除く条件（売り）",
+     tooltip="D が値段の下の％以上の日は売らない。")
+bdK      = input.float(1.2, "　％", step=0.1, group="除く条件（売り）")
+fLate    = input.bool(true, "売り：日の終わりまで短いときを除く", group="除く条件（売り）")
+lateH    = input.float(5.0, "　時間", step=0.5, group="除く条件（売り）")
+
+// ===== 区切り =====
+int VERN = 202611131
+bool isFut = cutSel == "先物（6:05）" or (cutSel == "自動" and syminfo.type == "futures")
+int  cutMs = isFut ? (6 * 60 + 5) * 60000 : 7 * 3600000
+int  JST   = 9 * 3600000
+
+dayNo(int t) =>
+    int(math.floor((t - cutMs + JST) / 86400000.0))
+
+int dn  = dayNo(time)
+int dnC = dayNo(time_close)
+int wkKey = int(math.floor((dn + 3) / 7.0))
+
+// 60分の区切り（先物：日中 8:45、夜間 17:00 から数える。CFD：時計の1時間）
+bucketKey(int t) =>
+    int h  = hour(t, "Asia/Tokyo")
+    int hm = h * 60 + minute(t, "Asia/Tokyo")
+    int k = 0
+    if isFut
+        bool ds = hm >= 480 and hm < 975
+        int anchor = ds ? 525 : (hm >= 990 and hm < 1020 ? 990 : 1020)
+        k := (ds ? 0 : 100) + int(((hm - anchor + 1440) % 1440) / 60)
+    else
+        k := ((h >= 7 and h < 17) ? 0 : 100) + h
+    k
+
+int  hmNow  = hour(time, "Asia/Tokyo") * 60 + minute(time, "Asia/Tokyo")
+int  ymd    = year(time, "Asia/Tokyo") * 10000 + month(time, "Asia/Tokyo") * 100 + dayofmonth(time, "Asia/Tokyo")
+int  nEndHM = ymd < 20210921 ? 330 : 360   // 夜間の引けの板寄せの足の始まり（分）
+int  dEndHM = ymd < 20241105 ? 915 : 945   // 日中の引けの板寄せの足の始まり（分）
+bool dayEnd = isFut ? (dnC != dn or hmNow == nEndHM) : (dnC != dn or (hour(time_close, "America/New_York") == 17 and minute(time_close, "America/New_York") == 0))
+bool chk    = bucketKey(time) != bucketKey(time_close) or dayEnd or (isFut and (hmNow == dEndHM or hmNow == nEndHM or hmNow == 945 or hmNow == 360))
+
+// ===== 期間ごとの OHLC と線 =====
+type Per
+    int   key = na
+    float o = na
+    float h = na
+    float l = na
+    float c = na
+    int   n = 0
+    float maxN = 0.0
+    bool  ok = false
+    float W = na
+    float D = na
+    float gam = na
+    float alp = na
+    float ome = na
+
+method step(Per p, int key) =>
+    if na(p.key) or key != p.key
+        if not na(p.o)
+            float C = p.c
+            float H = p.h
+            float L = p.l
+            bool bull = C >= p.o
+            p.D   := bull ? C - L : H - C
+            p.W   := bull ? 2 * C - H : 2 * C - L
+            p.gam := bull ? p.W + p.D : p.W - p.D
+            p.alp := bull ? p.W - p.D : p.W + p.D
+            p.ome := bull ? 2 * C - L : 2 * C - H
+            // 祝日などで本数がごく少ない期間の線は使わない
+            p.ok   := p.n >= 0.2 * p.maxN and p.maxN > 0
+            p.maxN := math.max(p.maxN * 0.98, p.n)
+        p.key := key
+        p.o := open
+        p.h := high
+        p.l := low
+        p.c := close
+        p.n := 1
+    else
+        p.h := math.max(p.h, high)
+        p.l := math.min(p.l, low)
+        p.c := close
+        p.n += 1
+
+var Per pd = Per.new()
+var Per pw = Per.new()
+// 日が変わる前に、前日の値幅と終値を記録（20日分）
+var array<float> rngs = array.new<float>()
+var array<float> clss = array.new<float>()
+if (na(pd.key) or dn != pd.key) and not na(pd.o)
+    rngs.push(pd.h - pd.l)
+    clss.push(pd.c)
+    if rngs.size() > 20
+        rngs.shift()
+        clss.shift()
+pd.step(dn)
+pw.step(wkKey)
+float prevRng = rngs.size() > 0 ? rngs.last() : na
+float avgRng  = rngs.size() == 20 ? rngs.avg() : na
+float ma20    = clss.size() == 20 ? clss.avg() : na
+
+// 日の終わりまでの時間（時間）
+float hLeft = 0.0
+if isFut
+    float m = (360 - hmNow + 1440) % 1440
+    hLeft := (m - ((hmNow >= 480 and hmNow < 975) ? 75 : 0)) / 60.0
+else
+    int hmNY = hour(time, "America/New_York") * 60 + minute(time, "America/New_York")
+    hLeft := ((1020 - hmNY + 1440) % 1440 - 5) / 60.0
+bool inDay = isFut ? (hmNow >= 480 and hmNow < 975) : (hour(time, "Asia/Tokyo") >= 7 and hour(time, "Asia/Tokyo") < 17)
+
+bool dOk = pd.ok and not na(pd.W) and pd.D > 0
+bool wOk = pw.ok and not na(pw.W)
+
+// ===== 判定（60分足の確定） =====
+var float prevChk = na
+var float tpLv = na
+var float slLv = na
+
+nearUp(float p, float m) =>
+    float r = na
+    for v in array.from(pd.alp, pd.W, pd.gam, pd.ome)
+        if v > p + m
+            r := na(r) ? v : math.min(r, v)
+    r
+
+nearDn(float p, float m) =>
+    float r = na
+    for v in array.from(pd.alp, pd.W, pd.gam, pd.ome)
+        if v < p - m
+            r := na(r) ? v : math.max(r, v)
+    r
+
+// 板寄せの足が無く、前の日の終わりで手じまえなかったとき（まれ）
+bool newDay = not na(dn[1]) and dn != dn[1]
+if isFut and newDay and strategy.position_size != 0
+    strategy.close_all(comment = "日の終わり（持ち越し）V" + str.tostring(VERN))
+
+f_v(float x) => na(x) ? "na" : str.tostring(x, "#.##")
+
+if chk
+    if strategy.position_size == 0 and not dayEnd and dOk and not na(prevChk) and time >= startT
+        float xu = na
+        float xd = na
+        for v in array.from(pd.alp, pd.gam, pd.ome)
+            if v > prevChk and v <= close
+                xu := na(xu) ? v : math.max(xu, v)
+            if v < prevChk and v >= close
+                xd := na(xd) ? v : math.min(xd, v)
+        bool okL = (not fQuiet or (not na(avgRng) and prevRng >= qK * avgRng)) and (not fSmallD or (not na(avgRng) and pd.D >= dK * avgRng)) and (not fDayL or inDay)
+        bool okS = (not fOS or (not na(ma20) and (ma20 - close) / close * 100 < osK)) and (not fBigD or pd.D / close * 100 < bdK) and (not fLate or hLeft >= lateH)
+        bool goL = not na(xu) and dirSel != "売りだけ" and (not useWk or (wOk and close > pw.W)) and okL
+        bool goS = na(xu) and not na(xd) and dirSel != "買いだけ" and (not useWkS or (wOk and close < pw.W)) and okS
+        if goL
+            float up = nearUp(close, 0.1 * pd.D)
+            tpLv := na(up) ? na : up - tpK * pd.D
+            slLv := xu - slK * pd.D
+            string cm = "L V" + str.tostring(VERN) + " a" + f_v(pd.alp) + " W" + f_v(pd.W) + " g" + f_v(pd.gam) + " o" + f_v(pd.ome) + " D" + f_v(pd.D) + " x" + f_v(xu) + " tp" + f_v(tpLv) + " sl" + f_v(slLv) + " wW" + f_v(pw.W) + " p" + f_v(prevChk)
+            strategy.entry("買い", strategy.long, comment = cm)
+            strategy.exit("買い決済", "買い", limit = tpLv, stop = slLv, comment_profit = "利確V" + str.tostring(VERN), comment_loss = "損切V" + str.tostring(VERN))
+        else if goS
+            float dw = nearDn(close, 0.1 * pd.D)
+            tpLv := na(dw) ? na : dw + tpK * pd.D
+            slLv := xd + slK * pd.D
+            string cm = "S V" + str.tostring(VERN) + " a" + f_v(pd.alp) + " W" + f_v(pd.W) + " g" + f_v(pd.gam) + " o" + f_v(pd.ome) + " D" + f_v(pd.D) + " x" + f_v(xd) + " tp" + f_v(tpLv) + " sl" + f_v(slLv) + " wW" + f_v(pw.W) + " p" + f_v(prevChk)
+            strategy.entry("売り", strategy.short, comment = cm)
+            strategy.exit("売り決済", "売り", limit = tpLv, stop = slLv, comment_profit = "利確V" + str.tostring(VERN), comment_loss = "損切V" + str.tostring(VERN))
+    prevChk := close
+
+// 日の終わりで決済
+if dayEnd and strategy.position_size != 0
+    strategy.close_all(comment = "日の終わりV" + str.tostring(VERN))
+
+// ===== 表示 =====
+plot(showLn and dOk ? pd.ome : na, "日 Ω",     color = #FF5252, style = plot.style_linebr)
+plot(showLn and dOk ? pd.gam : na, "日 γ",     color = #26C6DA, style = plot.style_linebr)
+plot(showLn and dOk ? pd.W   : na, "日 分水嶺", color = #FFEB3B, style = plot.style_linebr, linewidth = 2)
+plot(showLn and dOk ? pd.alp : na, "日 α",     color = #FFA726, style = plot.style_linebr)
+plot(showLn and wOk ? pw.W   : na, "週 分水嶺", color = color.new(#FFFFFF, 20), style = plot.style_linebr, linewidth = 2)
+plot(strategy.position_size != 0 ? tpLv : na, "利確", color = color.lime, style = plot.style_linebr)
+plot(strategy.position_size != 0 ? slLv : na, "損切", color = color.red,  style = plot.style_linebr)
